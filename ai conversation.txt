@@ -1,0 +1,392 @@
+You: Based on the initial result produced by the baseline model, what areas can be improved in order to try to achieve for a better performing model. What weaknesses does our current baseline model and process currently has that can be work about?
+-----------------------
+Claude: Your baseline (2-layer BiLSTM with GloVe, best checkpoint at epoch 13) scores 85.49% intent / 77.37% slot F1 on dev and 84.43% / 73.20% on test. Below are the weaknesses I see, most promising first. The numbers come from the notebook's outputs plus a quick count I ran on the dataset; I did not re-run the model.
+
+1. Known words are thrown away as <unk>
+In main.ipynb, the vocabulary is built from train only, so any dev/test word not in train becomes <unk>, even if GloVe has a vector for it.
+
+3.3% of dev words and 3.5% of test words are unknown. That affects 18% of dev utterances (364) and 19% of test utterances (563).
+About 88% of those unknown words are in GloVe (417 of 464 dev, 618 of 713 test). The model never sees vectors it already has.
+Unknown words tend to be slot values (names, places, songs), so this probably hurts slot F1 most. That would fit the bigger dev→test drop for slots (−4.2) than for intent (−1.1).
+Fixes:
+
+Add GloVe words to the vocabulary, either for all of GloVe or for dev/test words. Keep their embeddings frozen, or freeze all embeddings.
+Add a character-level encoder (char-CNN or char-LSTM) so spelling helps with words GloVe doesn't have.
+During training, randomly replace some words with <unk> ("word dropout") so the model learns to handle unknown words.
+2. Clear overfitting
+Dev loss is lowest at epoch 5 (0.855) and then climbs past 1.0. Train loss keeps falling to about 0.05.
+Dev scores stop improving around epoch 9 and then go up and down by about ±1 point.
+The model memorises train and grows over-confident: dev loss rises while dev F1 stays flat.
+Fixes: more dropout or embedding dropout, weight decay, label smoothing, a learning-rate schedule (ReduceLROnPlateau or cosine), and a smaller hidden size or fewer layers.
+
+3. Each word's slot tag is chosen on its own
+predict() takes the top-scoring tag for each word separately, so the model can output invalid sequences such as O → I-time. The decoder treats a stray I- like that as the start of a new slot, which gives broken or extra spans. A slot only scores if both its type and its exact words match, so one wrong boundary costs both a false positive and a false negative.
+
+Precision is below recall at the best epoch (dev P 76.3 / R 78.4, test P 72.5 / R 73.9), which suggests extra or broken slots.
+Fixes:
+
+A CRF layer on top of the slot scores, which learns which tags can follow which.
+Cheaper: constrained Viterbi decoding at prediction time that forbids O→I-x and B-x→I-y. This needs no retraining.
+4. The intent and slot parts barely share information
+The intent output only uses max-pooling over the words, and intent accuracy flat-lines at about 85–86% from epoch 5.
+The slot tagger never sees the predicted intent, even though the intent strongly limits which slot types make sense.
+Fixes:
+
+Attention pooling, or max-pooling and mean-pooling combined.
+Feed an intent signal into the slot tagger: a slot-gated model, or the intent embedding concatenated onto each word.
+Add scenario prediction as an extra training task. The scenario is just the prefix of the intent name, so it is a free coarse label.
+5. Some classes have almost no training data
+19 of the 55 slot types have fewer than 50 training examples. music_album and game_type have 1 each, sport_type 5, audiobook_author 6.
+Intents range from calendar_set (810 examples) to cooking_query (4).
+Micro-F1 hides this: rare classes are probably near 0, but the score is dominated by date, time and place_name.
+Fixes: class-weighted or focal loss, simple data augmentation (swapping slot values between utterances with the same slot type), and reporting scores per class.
+
+6. Weaknesses in the training and evaluation process
+One seed only. Dev scores move by about ±1 point between epochs, so the 4-point dev→test gap may partly come from picking a lucky epoch. Run 3–5 seeds and report mean ± std, otherwise Stage-2 gains won't be trustworthy.
+The two losses are simply added together, even though 33% of training utterances have no slots and most words are O. Try weighting them: intent loss + λ × slot loss.
+No hyperparameter search. Every value (learning rate, hidden size, dropout, batch size) is fixed by hand.
+No error analysis in the notebook. There is no per-intent or per-slot breakdown, no confusion matrix, and errors are not split into wrong boundary, wrong type, missed slot and extra slot. Do this first: it tells you which of the fixes above will pay off most.
+7. Bigger change, if the brief allows it
+A small pretrained transformer under the 20M-parameter limit (for example BERT-mini or BERT-small sized) would mostly fix #1 and #4 at once, using subword tokens and context-aware word vectors. Check the brief before using one.
+
+Where I'd start: fix the unknown words (#1), add CRF or constrained decoding (#3), add regularization (#2), and run several seeds. They are cheap, and the evidence for each is already in your outputs.
+-----------------------
+You: Would like to check, why would freezing the Glove embedding be better? Also what is character label encoder and how will that help our current model? Would randomly replacing words with unk may possibly worsen the performance?
+-----------------------
+Claude: Short answers: freezing GloVe isn't automatically better, it only fixes one specific problem. A character-level encoder builds a word's vector from its spelling. And yes, word dropout can hurt if you overdo it, but your current setup has a gap it fills.
+
+1. Why freeze the GloVe embeddings?
+The problem it solves. Say you add dev/test words that GloVe knows to the vocabulary. Those words never appear in train, so their embedding rows never get a gradient. They stay exactly as raw GloVe.
+
+Meanwhile, the embeddings of train words move away from GloVe during training. The BiLSTM learns to read those moved vectors. At test time, an unseen word comes in with an original GloVe vector, while its neighbours (for example "song" and "track") have drifted. The model reads the two kinds of vector differently, so much of the benefit of adding the word is lost.
+
+Freezing keeps every word in the same, unchanged GloVe space. The model learns to read GloVe itself, so a word it never saw in training still makes sense to it.
+
+The cost. The embeddings can no longer adapt to your task. That matters here because GloVe puts opposites close together: on/off, up/down, increase/decrease, like/dislike. Those pairs decide intents like iot_hue_lighton vs iot_hue_lightoff or audio_volume_up vs audio_volume_down. Fine-tuning can push them apart; freezing can't.
+
+Middle-ground options:
+
+Frozen GloVe plus one shared trainable linear layer on top. Every word, seen or unseen, goes through the same learned transformation, so unseen words get adapted too. This is usually the best compromise.
+Freeze for the first few epochs, then unfreeze with a lower learning rate.
+Keep trainable vectors for the 384 train words GloVe doesn't have. They have no GloVe vector, so they need one learned from scratch either way.
+Which wins is an empirical question, so try them on dev.
+
+2. What a character-level encoder is and how it helps
+Right now each word is one id, looked up in a table. A character encoder also builds a vector from the word's letters:
+
+
+"wednesdays" → w e d n e s d a y s → char embeddings (≈30-dim each)
+             → 1-D CNN + max-pool (or a small BiLSTM) → char vector (≈50–100-dim)
+final word vector = [GloVe vector ; char vector] → BiLSTM (as now)
+It adds very few parameters (well under 100K), so the 20M limit isn't an issue.
+
+How it helps your model:
+
+Words neither train nor GloVe knows. From my count, that's about 47 words in dev and 95 in test. Today they all become the same <unk>.
+Word forms and spelling variants. It can link wednesdays to wednesday, alarms to alarm, tomorrow's to tomorrow, and handle typos.
+Word shape, which matters for slots. Digits and patterns like "7am", "5:30" or "o'clock" (time), "@" and ".com" (email_address), and number-like words (change_amount) all get useful signals.
+Downsides: slightly slower training, a small extra overfitting risk, and the gain is mostly on rare or unseen words. Expect it to help slot F1 more than intent accuracy.
+
+3. Could randomly replacing words with <unk> hurt?
+Yes, if done carelessly. But your current setup has a problem that makes it worth trying:
+
+With MIN_FREQ = 1, no training word ever maps to <unk>. Its embedding is never updated and stays at its random starting value. At test time, the roughly 3.5% of unknown words are fed a random vector the model has never learned to read.
+
+Word dropout fixes this. During training only, each word is swapped for <unk> with a small probability. This teaches the <unk> vector to mean "some unknown word", so the model learns to use the surrounding words instead.
+
+How it can hurt:
+
+Too high a rate destroys the signal. MASSIVE has many very short utterances ("quiet", "olly quiet"). Replacing the key word leaves an example that can't be labelled correctly, which is just noise.
+It removes slot words. If "james" becomes <unk>, the model still has to tag it B-person. That's useful practice in moderation, but too much makes the tagger guess from context alone.
+It can be unnecessary. If you add GloVe words to the vocabulary and add a char encoder, true <unk> cases become rare, and the gain shrinks to ordinary regularization.
+How to use it safely:
+
+Use a small rate, about 0.05–0.1, and tune it on dev.
+Replace rare words more often than common ones. A common rule is to replace a word with probability α / (α + its train count). Rare words are the ones most likely to be unknown at test time.
+Never replace every word in an utterance, and turn it off at evaluation time.
+If you add a char encoder, replace only the word embedding and keep the characters. The model then learns to fall back on spelling when it doesn't know a word, which is exactly the situation it faces at test time.
+-----------------------
+You: Before everything else first, I notice you suggested doing error analysis first, how would that really help improve the model?
+-----------------------
+Claude: Error analysis shows where the model loses points and why. That tells you which fix to try first, rather than trying all of them and hoping. Much of my earlier list is educated guessing from the overall scores, and error analysis checks those guesses against your own model.
+
+Why it helps
+1. One score hides very different failures. Slot F1 of 77% could mean the model gets slot boundaries slightly wrong, confuses date with time, or misses rare slot types entirely. Each needs a different fix, and the overall score can't tell them apart.
+
+2. Each type of error points to a specific fix. If you sort the wrong slots into categories, the biggest category tells you what to work on:
+
+Error type (dev)	Example: gold [time : five am]	Likely fix
+Wrong boundary (right type, wrong words)	predicted time: five	CRF / constrained decoding
+Wrong type (right words, wrong type)	predicted date: five am	feed the intent into the slot tagger, char features
+Missed slot	nothing predicted	class weighting, data augmentation
+Extra slot (no gold slot there)	time: me	regularization, CRF
+Invalid BIO (I- with no B- before it)	count of these	constrained decoding (no retraining)
+If, say, 50% of errors were boundary errors, CRF would be the obvious first step. If boundary errors were only 10%, CRF would add complexity for little gain.
+
+3. It tests the guesses I made earlier. For example:
+
+Unknown words (#1): compare slot F1 on dev utterances that contain an unknown word against those that don't. A large gap means fixing the vocabulary is worth it. A small gap means it isn't the bottleneck.
+Rare classes (#5): per-slot-type F1 sorted by training count shows whether rare types really score near 0, and how many points they cost overall.
+Intent head (#4): an intent confusion matrix shows whether errors are random or come from a few pairs, like lighton/lightoff or volume_up/volume_down. Pairs like those point to GloVe placing opposites close together, which supports fine-tuning the embeddings rather than freezing them.
+4. It spends your effort where the points are. Micro-F1 weights frequent slot types. Fixing a type with 1 training example can't move the score much, while a 5-point gain on date or time would. Counting errors by category shows where the points actually are.
+
+5. It gives your Stage 2 report a clear story. "We found X% of slot errors were boundary errors, so we added a CRF, and boundary errors dropped to Y%" is a much stronger argument than "we added a CRF and F1 went up". It also explains why a change worked, or why one didn't.
+
+Two practical points
+It's cheap. It runs on the checkpoint you already saved (baseline_bilstm_2layers.pt), so nothing needs retraining.
+Do it on dev, not test. If you choose improvements based on test errors, the test score stops being a fair final measure.
+-----------------------
+You: Would like to check what is CRF layer and how will that help our current model?
+-----------------------
+Claude: A CRF (conditional random field) layer sits on top of your slot output and chooses the whole tag sequence at once, instead of each word's tag on its own. It learns which tags may follow which, so it stops the model producing invalid or inconsistent tag sequences.
+
+What your model does now
+In JointBiLSTM, the slot_head gives each word a score for each of the 111 tags. predict() then takes the highest-scoring tag for each word separately:
+
+
+word:     wake  me  up  at   five    am
+argmax:   O     O   O   O   B-time  I-date   ← each word decided alone
+Each choice is reasonable by itself, but together they make an invalid sequence: I-date cannot follow B-time. Your decoder handles this by treating the stray I-date as a new slot. You get two wrong slots (time: five and date: am) instead of one correct time: five am. Because the scorer needs exact matches, that costs one false negative and two false positives.
+
+The model has no way to say "the previous word was B-time, so this one is probably I-time".
+
+What a CRF adds
+1. A transition matrix. This is a learned 111 × 111 table of scores for "tag A followed by tag B", about 12K parameters. After training it learns, for example:
+
+B-time → I-time: high score
+B-time → I-date: very negative
+O → I-anything: very negative
+2. Scoring whole sequences. The score of a tag sequence is the sum of each word's own tag score (what your slot_head already outputs) plus the transition score between every pair of neighbouring tags.
+
+3. Training. The slot cross-entropy loss is replaced by the CRF loss. It raises the score of the correct full sequence relative to all possible sequences, computed efficiently with the forward algorithm. The intent loss stays as it is.
+
+4. Prediction. Instead of argmax per word, the Viterbi algorithm finds the single highest-scoring sequence. In the example above, B-time I-time wins because the transition B-time → I-date is heavily penalised:
+
+
+CRF:      O     O   O   O   B-time  I-time   ✓  → time: five am
+How it helps your model
+No invalid BIO sequences. Slots are always whole, never broken into pieces.
+Consistent types within a slot. A slot can't switch type halfway through.
+Better boundaries. The tag choices around a slot's edges become linked. This matters a lot under exact-match scoring, where being off by one word scores zero.
+It may lift precision. Your precision is below recall (dev 76.3 / 78.4), which suggests extra or broken slots, the kind of error a CRF prevents.
+Limitations
+The gain is usually modest. On BiLSTM taggers it's often about 1–2 F1, because the BiLSTM already sees context in both directions. Your error analysis would show how many points are really available: count the invalid sequences and boundary errors.
+It doesn't fix the other weaknesses. Unknown words, wrong slot types and rare classes stay as they are; those need the vocabulary, char-encoder and class-weighting fixes.
+Training is somewhat slower, because the CRF loss and Viterbi decoding have to go through the sequence step by step.
+A cheaper first test: constrained decoding
+You can get much of the "no invalid sequences" benefit without retraining. Keep your current model and run Viterbi with a fixed transition table that forbids invalid moves (O → I-x, B-x → I-y, I-x → I-y) and allows everything else. If this alone improves dev F1, a trained CRF will probably improve it further. If it barely changes anything, the CRF is unlikely to be worth the effort.
+
+Fitting it into your code
+Use the pytorch-crf package (from torchcrf import CRF), or write it yourself; it's about 60 lines.
+Pass attention_mask as the CRF mask, so padding is skipped. The CRF needs real tag ids at padded positions, so replace the -100 padding labels with 0 there.
+Replace slot_loss_fn(...) with the CRF's negative log-likelihood, and slot_logits.argmax(-1) in predict() with crf.decode(...).
+-----------------------
+You: can you clarify point 4 regarding the 'feed an intent signal' and the 'add scenario prediction'
+-----------------------
+Claude: These are two separate ideas. Both try to make the model share more information between its outputs, but in different ways:
+
+Feeding an intent signal helps the slot tagger by telling it what the utterance is about.
+Scenario prediction helps the intent classifier by giving it an easier, coarser task to learn alongside.
+A. Feeding an intent signal into the slot tagger
+The problem now
+In JointBiLSTM, both outputs read from the same BiLSTM, but they work in parallel:
+
+
+BiLSTM output ──► slot_head   → slot tags
+              └─► max-pool → intent_head → intent
+The slot tagger never sees what the intent is. Yet the intent strongly limits which slot types make sense:
+
+Utterance	Intent	Correct slot
+play jazz	play_music	music_genre
+play jazz fm	play_radio	radio_name
+set alarm for five	alarm_set	time
+what's on my calendar friday	calendar_query	date
+When the tagger finds a slot but gives it the wrong type, the missing piece is often "what is this utterance about?". The intent answers exactly that.
+
+How to do it
+Simple version: concatenation. Turn the intent prediction into a vector and attach it to every word's BiLSTM output before the slot head
+
+Fancier version: slot-gated model (Goo et al., 2018). Instead of attaching the vector, a learned gate uses the intent to decide how much each word's features should count for slot tagging. It's the same idea with more parameters; try the simple version first.
+
+Points to watch
+Use the predicted intent probabilities, not the correct intent label. At test time only the prediction exists. If you train with the correct label, the tagger learns to trust a signal that is always right in training but wrong about 15% of the time at test.
+Errors can spread. If the intent is wrong, the slot types may now be wrong too. Probabilities soften this: if the model is unsure between play_music and play_radio, both keep weight.
+It mainly fixes wrong-type errors, not boundary errors. Your error analysis shows whether wrong-type errors are a big share of the slot errors.
+B. Adding scenario prediction as an extra training task
+What "scenario" is
+Every MASSIVE record has a scenario field (18 values: alarm, audio, iot, music, cooking, …). It's a coarse group of intents, usually visible in the intent name
+
+How to do it
+Add a third output head next to the intent head, used only during training:
+The model's input is still only the words. The scenario is just an extra label it learns to predict during training, so nothing changes at test time. Its prediction can simply be ignored, or used for the consistency check below.
+
+Why it can help
+Rare intents borrow from related ones. cooking_query has only 4 training examples. On its own, the intent head barely learns it. The scenario head learns "this is about cooking" from all cooking utterances, and the shared encoder carries that over to the rare intent.
+An easier task to learn first. Telling apart 18 broad topics is easier than 60 fine-grained intents. That gives the encoder a cleaner basis to work from, and also acts as mild regularization.
+Optional consistency check. At prediction time, you can only allow intents that belong to the predicted scenario, or add each intent's score to its scenario's score. This rules out nonsensical predictions such as alarm_set for a cooking question.
+Limitations
+It adds no new information. The scenario follows directly from the intent label, so it reorganises the training signal rather than adding to it. Expect a small gain (about 0–1 point), mostly on rare intents.
+It doesn't help confusions within one scenario, such as iot_hue_lighton vs iot_hue_lightoff, because both are iot. Your intent confusion matrix shows which kind dominates. If most intent errors stay inside one scenario, this idea won't help much.
+Check it's allowed. Your notebook states the scenario field isn't used. Using it only as a training label is usually fine, but confirm with your group and the assignment brief before relying on it.
+How they fit together
+A (intent → slots) mostly targets slot errors of the wrong type.
+B (scenario head) mostly targets intent errors on rare or cross-scenario cases.
+-----------------------
+You: Would like to check with point 5 'class-weighted or focal loss, simple data augmentation' what does this means?
+-----------------------
+Claude: These are three ways to deal with class imbalance: some labels have hundreds of training examples, others only a handful. Your data is very uneven:
+
+Slot types: 19 of 55 have fewer than 50 training examples. music_album and game_type have 1 each, sport_type 5, audiobook_author 6.
+Intents: calendar_set has 810 examples, cooking_query has 4.
+Tags: most words are O, and 33% of training utterances have no slots at all.
+With plain cross-entropy, every training word counts the same. The loss is dominated by O and the common classes, so the model has little reason to learn rare ones. The three techniques below fix this from different angles.
+
+1. Class-weighted loss
+Idea: give mistakes on rare classes a bigger penalty, so the model pays more attention to them.
+
+Each class gets a weight that is larger when the class is rarer, usually something like 1 / count, often softened with a square root
+Slot tags work the same way: count each of the 111 tags in tag_ids and pass the weights to slot_loss_fn. This also lowers the weight of O.
+
+Risks:
+
+It can lower your overall score. Micro-F1 is dominated by frequent slots like date, time and place_name. Pushing the model toward rare classes can add extra slots and cost precision on the common ones. The square root above, or a cap on the weights, keeps this in check.
+Very rare classes get extreme weights. With 1 example, music_album would get a huge weight, and the model would overfit to that single sentence. Cap the weights, for example at 10×.
+Plain weights don't fit a CRF. The CRF loss scores the whole sequence, so it has no per-class weight setting.
+2. Focal loss
+Idea: instead of weighting by class, weight by how hard each example is. Words the model already gets right with high confidence contribute almost nothing; words it gets wrong or is unsure about dominate the loss.
+
+Focal loss multiplies cross-entropy by (1 − p)^γ, where p is the model's probability for the correct class:
+
+p (confidence in the correct tag)	(1 − p)² with γ = 2	Effect
+0.99 (easy O)	0.0001	ignored
+0.6	0.16	reduced
+0.1 (hard, rare slot)	0.81	almost full loss
+
+Why it fits your data: the thousands of easy O words stop swamping the loss, without you choosing weights by hand. Rare classes tend to be the hard ones, so they get more attention automatically.
+
+Risks: γ needs tuning (try 1 to 2). Mislabelled or truly ambiguous examples always stay "hard", so the model can over-focus on them. Like class weights, focal loss doesn't fit a CRF directly.
+
+3. Simple data augmentation
+Idea: create extra training examples for rare classes by changing existing ones.
+
+Slot value swapping is the most natural method for your data. Take a training utterance and replace a slot's words with another value of the same slot type seen elsewhere in train
+The intent and the BIO tags follow automatically: the new words get B-song_name I-song_name. Apply it mostly to utterances that contain rare slot types or rare intents, so they get extra copies.
+
+Other simple options:
+
+Oversampling: repeat utterances from rare intents or slot types more often in each epoch. It's the easiest option, but the model sees the exact same sentences again, so it can overfit.
+Word dropout (from earlier) is also a kind of augmentation.
+Risks:
+
+Unnatural sentences. Swapping a value can produce odd combinations, such as an artist paired with the wrong song. That's usually harmless, but don't swap across slot types.
+It can't create real variety for 1-example classes. With one music_album example, swapping gives new album names in the same sentence. The value changes, but the model still learns only one way of phrasing it.
+Keep it to train. Augment only the training data, using only values from train. Never touch dev or test. Your notebook says the data is used exactly as released, so check that the brief allows train-side augmentation.
+------------------------
+You: We ran the error analysis you suggested on dev with the Stage-1 checkpoint which below are the results:
+utterances with a word unseen in train: 72.25% intent / 51.10% all slots exact vs 88.38% / 79.15% for the rest; 417 of 464 unseen words are in GloVe
+slot mistakes: 230 boundary, 192 extra, 168 missed, 67 wrong type; 95 invalid I- tags
+weakest slots: news_topic 46.75, song_name 53.06, radio_name 53.33
+top intent confusions: qa_factoid→general_quirky (14), calendar_set→calendar_query (8)
+
+So our plan will be a frozen GloVe table with the train words plus the 40k most common GloVe words (40,942 rows, 12.3M numbers). The whole model is 16.1M parameters, under the 20M cap. We did not use all available GloVe words because that tallys up to 120M parameters. We also did not pick words from dev/test, so the evaluation data doesn't shape the model. On top of that we followed the suggestions and added a small trainable embedding with word dropout, a char-CNN, a CRF, attention pooling with the utterance summary added to each slot decision, and AdamW with LR halving
+------------------------
+Claude: Your plan fits the error analysis well. Each change targets a problem you actually measured, and choosing the 40k words by GloVe frequency, not from dev/test, is the right call. I reproduced your 40,942 rows exactly, so the vocabulary is built the way you describe.
+
+What the error analysis says
+Unseen words are the biggest weakness. Utterances with an unseen word score 51% vs 79% on all-slots-exact, and 72% vs 88% on intent. That justifies the frozen GloVe table, word dropout and the char-CNN.
+Slot errors are mostly about boundaries, not types. Of 657 slot mistakes, 230 are boundary (35%), 192 extra (29%), 168 missed (26%) and only 67 wrong type (10%). Together with the 95 invalid I- tags, that supports the CRF.
+Feeding the utterance summary into each slot decision targets the smallest error group. Wrong-type errors are only 10%, so expect a small gain from it.
+The weakest slots (news_topic, song_name, radio_name) are free-text names. They're long, varied and often unseen, so they suffer from boundary and unseen-word errors together. The CRF and the char-CNN are the parts most likely to help them.
+Intent confusions mostly stay within a scenario. calendar_set→calendar_query is inside one scenario, so leaving out the scenario head makes sense. qa_factoid→general_quirky is likely partly label noise: general_quirky is a catch-all, and some of those utterances are genuinely ambiguous. Don't expect to remove that confusion fully.
+How much the 40k table covers
+I counted how many unseen dev/test words now get a real GloVe vector:
+
+Unseen words (in GloVe / all)	top 40k (your plan)	top 53k	top 100k
+dev (417 / 464)	354 (76%)	372	395
+test (618 / 713)	521 (73%)	543	576
+About a quarter of unseen words are still handled only by the char-CNN. You have about 3.9M parameters of headroom, roughly 13k more rows. Going to 53k would cover about 20 more words in each split, which is a small gain. It's fine to stay at 40k. If you do change it, base the number on the cap ("as many rows as fit under 20M"), not on dev scores.
+
+Things to check in the implementation
+Word dropout should only replace the trainable embedding's id. At test time, a word unseen in train has a trainable <unk> vector but still has its GloVe vector and its characters. Training should create the same situation, so keep the GloVe lookup and chars when you drop a word. If you drop all three, the model trains on a situation it never meets at test.
+The 556 train words outside the top 40k aren't missing. The table is the union of train words and the top 40k, so they keep their GloVe vectors. Only the 384 train words with no GloVe vector need a fill-in. Give those GloVe rows zeros (or another fixed value) and let the trainable embedding and char-CNN carry them.
+Leave the frozen table out of the optimizer, or confirm requires_grad=False. Frozen rows get no gradient, so AdamW leaves them alone, but it keeps things clear.
+Report both parameter counts. Of the 16.1M total, 12.3M are frozen, so only about 3.8M are trainable, fewer than the baseline's 4.4M. That's a good point for your report: the gains come from better inputs and structure, not a bigger model.
+Set the schedule's patience below early-stopping patience, and make sure it watches dev combined, the same score you use to pick checkpoints. That way the learning rate actually gets halved before training stops.
+Gaps in the plan
+Five changes at once means you can't tell which one helped. Run an ablation: the full model, then the full model minus one component at a time (no CRF, no char-CNN, no word dropout, trainable instead of frozen GloVe, and so on). Your report needs this to justify each piece, and it may show that one component adds nothing.
+Use several seeds. Dev scores varied by about ±1 point per epoch in the baseline, so differences between ablation rows of under 1 point aren't meaningful from one run. Run 3 seeds per setting if time allows, at least for the full model and the baseline.
+Nothing targets missed slots (168) or rare classes. If missed slots are still a large group after this model, slot value swapping is the option that works with a CRF; focal loss and class weights don't.
+Watch dev overfitting. With this many design choices tuned on dev, the dev→test gap could widen; it was already 4 points on slots. Look at test only once, at the end.
+After training
+Run the same error analysis on the new model and put the two side by side: the unseen-word gap, the counts per slot error type, invalid I- tags (which should drop to 0 with the CRF), the weakest slots and the top confusions. "Boundary errors went from 230 to X" shows each fix doing its job, which a single overall score can't show.
+---------------------------
+You: We checked the implementation you pointed out. Word dropout only replaces the trainable id, the 384 train words with no GloVe vector get zero rows, the optimizer only gets trainable parameters, LR patience is 3 vs early stopping 8, and both watch dev combined. After training, the error analysis on dev gives: boundary errors 230 → 145, invalid I- tags 95 → 0, and unseen-word utterances 51.10% → 64.29% all slots exact.
+
+Addressing the gaps pointed out, we shall perform ablation test for the following components no CRF, no char-CNN, no word dropout, trainable instead of frozen GloVe and we run another 2 seeds for the final comparison.
+
+Our group also decide to reject the slot-value swapping suggestion as we are not to re-split, add, or remove examples and no external or AI-generated task examples are allowed
+
+We also decided to reject the class-weighted and focal loss suggestions. This mainly because rare types makes up of only 3.0% of dev slots and they do not fit a CRF loss, the scenario task lists only intent and annot_utt as labels, and a small pretrained transformer is not allowed
+---------------------------
+Claude: Your results back the changes up. The CRF removed every invalid tag and cut boundary errors by 37%, and the unseen-word fixes added 13 points exactly where the baseline was weakest. Your reasons for the rejections hold. I have two additions to the ablation plan and one technical catch.
+
+The results
+Boundary errors 230 → 145 (−37%), invalid I- 95 → 0. That's what the CRF is for.
+Unseen-word utterances 51.10% → 64.29% (+13.2 points). A large gain, and in the spot the error analysis pointed to.
+Finish the before/after table. To complete it you still need:
+the seen-word group's score for the new model, so you can show whether the gap (28 points in the baseline) actually narrowed, not just moved up together;
+extra, missed and wrong-type counts. Extra slots (192) were the second-largest group, and the CRF should have reduced them too;
+the overall dev scores (intent accuracy, slot F1, combined) next to the baseline's 85.49 / 77.37.
+Your rejections
+Slot value swapping: correct under your rules. In the report, briefly say why word dropout isn't the same thing. It adds no examples: it's random noise applied to existing training utterances each batch, like ordinary dropout, and the training set stays exactly as released.
+Class weights and focal loss: sound reasoning. At 3.0% of dev slots, perfect rare-type performance would add at most about 3 F1 points, and realistically far less. Not fitting the CRF loss settles it.
+Scenario head and small transformer: both ruled out by the brief, so there's nothing more to discuss.
+Ablation plan
+1. Add a "no utterance summary in slot decisions" row. It targets the smallest error group (wrong type, 10%), so it's the component most likely to add nothing. If you want to cover everything, also test max-pooling instead of attention pooling for the intent, and Adam with a fixed learning rate instead of AdamW with LR halving.
+
+2. Fix weight decay in the "trainable GloVe" row. If the 40,942-row table becomes trainable under AdamW, the roughly 35.6k rows for words never seen in train get zero gradient. But they sit in the same tensor as the train words, so AdamW's weight decay still shrinks them every step. By the end of training, the GloVe vectors for unseen dev/test words would have shrunk well away from their original values. The ablation would then measure "trainable + decayed GloVe" and make trainable look worse than it really is. Put the embedding in its own parameter group with weight_decay=0.
+
+3. Know what to expect from "no word dropout". With MIN_FREQ = 1, no training word maps to <unk>, so without word dropout the trainable <unk> vector never gets trained. The gap should show up mainly in the unseen-word group, so report that score in the ablation table, not just the overall score.
+
+4. Seeds. If the ablation rows use one seed each, treat differences under about 1 point as inconclusive, since the baseline's dev scores moved by ±1 point between epochs. Run every setting with the same set of seeds and report mean ± std for the 3-seed final comparison. Make all ablation decisions on dev; report test numbers once, without using them to choose anything.
+----------------------
+You: We have run all the ablation and seeds run and with these we are closing it. In the end we applied the weight decay suggestion suggested in the ablation for the glove fine tuning run.
+
+For now we are not running the adam with the fixed LR row and the 3 seeds per ablation as that will take alot of time and we feel that the single seed rows ablation and the 2 additional seed runs for the stage 2 model are enough for our conclusion
+-----------------------
+Claude: Your results support your conclusion, and skipping the fixed-LR row and per-ablation seeds is reasonable. Before you close, though, two things in the notebook need fixing: some of the written text no longer matches the outputs, and the ablation section has no written conclusion yet.
+
+1. The 6.1 Findings text uses numbers from an earlier run
+Stage 1 was re-run: the checkpoint is now best epoch 22 of 30, dev 85.15 / 78.21, where it used to be epoch 13, 85.49 / 77.37. The 6.1 outputs were regenerated, but the markdown under them (cell 35) still has the old numbers:
+
+Finding	Markdown says	Output now shows
+Stage-1 dev scores	85.49 / 77.37	85.15 / 78.21
+Unseen-word utterances (intent / all slots exact)	72.25 / 51.10	72.53 / 50.82
+Seen-word utterances	88.38 / 79.15	87.90 / 80.17
+Invalid I- tags	95	93
+Boundary / extra / missed / wrong type	230 / 192 / 168 / 67 (657)	233 / 205 / 142 / 68 (648)
+radio_name / news_topic / song_name F1	53.33 / 46.75 / 53.06	38.30 / 48.72 / 53.33
+artist_name F1	71.60	73.81
+qa_factoid → general_quirky	14	11
+Overfitting (finding 6)	"lowest at epoch 5 (0.85), 1.22 by epoch 23"	the new run trained to epoch 30, so check against the new curve
+The figures you gave me last turn (boundary 230 → 145, unseen 51.10 → 64.29) are also from that earlier run. The notebook now shows 233 → 159 and 50.82 → 64.56. Make the report quote the current outputs. The conclusions don't change, only the numbers.
+
+2. The ablation needs a written conclusion
+The cell prints "not worse, revisit this choice" for four rows, but nothing after it does the revisiting. Seed variation gives a sense of scale: the dev std across seeds is 0.58 for intent and 0.21 for slot F1, so differences in dev combined of a few tenths of a point are within noise. Here's how I'd read each row:
+
+Component	Change in dev combined when removed	Reading
+CRF	−1.35	Clearly helps. Without it, invalid tags go 0 → 72 and boundary errors 159 → 235
+Char-CNN	−0.44	Helps, mainly on unseen words (64.56 → 59.62 all slots exact)
+Word dropout	−0.05	No measurable effect. Unseen-word all-slots-exact is actually slightly higher without it (65.11). My earlier expectation that it would show up in that group wasn't borne out, probably because GloVe and the char-CNN already handle unseen words
+Utterance summary	+0.51	No evidence it helps; the best single row is without it. Possibly mild harm, but one seed can't tell
+Attention pooling	+0.30 / +0.09	No evidence it helps. Max pooling alone gives more extra slots (229 vs 187), so the pieces interact
+Frozen GloVe	+0.21 for fine-tuning	Same on overall score. Freezing is justified by unseen words (64.56 vs 62.36) and 3.8M vs 16.1M trainable parameters, which is exactly what it was meant for
+What to do with it: keep the final model as it is and say so plainly. For example: "The CRF and char-CNN account for the measurable gain. Word dropout, attention pooling and the utterance summary show no measurable benefit in single-seed ablations." Switching the final model now, based on single-seed dev differences, would be over-reading noise. Also replace the "revisit this choice" print with neutral wording such as "within noise", or delete it.
+
+A caveat to add: several ablation runs picked their last or almost last epoch (no CRF 40/40, max pooling 40/40, no utterance summary 39/40, no word dropout 37/40). They were still improving at the 40-epoch limit, so their scores may be slightly underestimated. Add one sentence saying so.
+
+3. Other points for the write-up
+The gain is larger on test than on dev. Slot F1 rose +3.2 on dev (78.21 → 81.44) but +6.1 on test (73.16 → 79.24). The dev→test gap shrank from 5.1 to 2.2 points. That fits test having more unseen words (3.5% vs 3.3%) and the fixes targeting them. It's one of your strongest results.
+The gain comes from unseen words. Seen-word utterances barely moved (80.17 → 80.83 all slots exact), while unseen-word ones rose by 13.7 points.
+The seed results back the Stage 1 vs Stage 2 claim. Stage 2's test std is 0.14 (slot) and 0.24 (intent), far below the roughly 6-point gain. So the baseline having one seed doesn't weaken the comparison. Say that explicitly; it's the justification for not running more seeds.
+What's still unsolved: wrong-type errors went up slightly (68 → 73). general_quirky is now in most of the top intent confusions, as the true intent in 5 of the top 6 pairs. Name-type slots (song_name, news_topic, radio_name) are still the weakest at 55–59 F1. That's a natural "remaining weaknesses" paragraph.
